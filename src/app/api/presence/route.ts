@@ -1,0 +1,111 @@
+// --- Online visitors: beacon endpoint ---
+// Every visitor's browser POSTs a tiny JSON body here once a minute while the
+// page is visible, and a "bye" when the tab is hidden or closed (see
+// src/components/presence/presence-beacon.tsx). Anonymous by design: guests
+// count too. Registered visitors are recognised from the existing gaming_id
+// cookie that the browser sends along automatically; because that cookie is not
+// signed, the store only labels a visitor "registered" after checking that the
+// Gaming ID really exists.
+//
+// The endpoint is deliberately silent: it always answers 204, whether or not
+// the ping was accepted, so nobody can learn from it what was counted. It is
+// strictly validated and rate limited per IP so it cannot be used to fill the
+// database. It only ever writes to the two presence collections.
+
+import { NextResponse, type NextRequest } from 'next/server';
+import { getClientIp } from '@/lib/client-ip';
+import { rateLimit } from '@/lib/rate-limit';
+import { recordHeartbeat, recordLeave } from '@/lib/presence/store';
+import {
+    IGNORED_PATH_PREFIXES,
+    MAX_BODY_BYTES,
+    MAX_GAMING_ID_LENGTH,
+    VISITOR_ID_PATTERN,
+    isSafeVisitorPath,
+    type PresenceBeaconBody,
+} from '@/lib/presence/types';
+
+export const dynamic = 'force-dynamic';
+
+// Many phones share one mobile-network IP, so the cap is generous; it only has
+// to stop floods, not real visitors.
+const IP_LIMIT = { limit: 300, windowMs: 60_000 };
+
+function done(): NextResponse {
+    return new NextResponse(null, { status: 204, headers: { 'Cache-Control': 'no-store' } });
+}
+
+function isIgnoredPath(path: string): boolean {
+    return IGNORED_PATH_PREFIXES.some((prefix) => path === prefix || path.startsWith(`${prefix}/`));
+}
+
+/** Pathname only: no query string, no fragment, nothing that could point at another site. */
+function cleanPath(value: unknown): string | null {
+    if (typeof value !== 'string') return null;
+    const path = value.split('?')[0].split('#')[0];
+    return isSafeVisitorPath(path) ? path : null;
+}
+
+/** The raw cookie value, only if it could plausibly be a Gaming ID. Verified later against the users collection. */
+function claimedGamingId(request: NextRequest): string | null {
+    const value = request.cookies.get('gaming_id')?.value?.trim();
+    if (!value || value.length > MAX_GAMING_ID_LENGTH) return null;
+    for (let index = 0; index < value.length; index++) {
+        const code = value.charCodeAt(index);
+        if (code < 32 || code === 127) return null; // control characters
+    }
+    return value;
+}
+
+function parseBody(raw: string): PresenceBeaconBody | null {
+    let data: unknown;
+    try {
+        data = JSON.parse(raw);
+    } catch {
+        return null;
+    }
+    if (!data || typeof data !== 'object') return null;
+    const { v, k, p, a } = data as Record<string, unknown>;
+    if (typeof v !== 'string' || !VISITOR_ID_PATTERN.test(v)) return null;
+    if (k !== 'hb' && k !== 'bye') return null;
+    const path = cleanPath(p);
+    if (!path) return null;
+    return { v, k, p: path, a: a === true };
+}
+
+export async function POST(request: NextRequest): Promise<NextResponse> {
+    const ip = getClientIp(request.headers);
+    if (!rateLimit(`presence:${ip}`, IP_LIMIT).allowed) return done();
+
+    const declared = Number(request.headers.get('content-length') ?? 0);
+    if (declared > MAX_BODY_BYTES) return done();
+
+    let raw: string;
+    try {
+        raw = await request.text();
+    } catch {
+        return done();
+    }
+    if (raw.length > MAX_BODY_BYTES) return done();
+
+    const body = parseBody(raw);
+    if (!body || isIgnoredPath(body.p)) return done();
+
+    try {
+        if (body.k === 'bye') {
+            await recordLeave(body.v);
+        } else {
+            await recordHeartbeat({
+                visitorId: body.v,
+                path: body.p,
+                claimedGamingId: claimedGamingId(request),
+                ip,
+                userAgent: request.headers.get('user-agent') ?? '',
+                standalone: body.a === true,
+            });
+        }
+    } catch (error) {
+        console.error('[presence] could not record beacon:', error);
+    }
+    return done();
+}
